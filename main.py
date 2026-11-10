@@ -246,7 +246,7 @@ def _query_inservice_city(city_code: str, city_name: str, today: date):
         vs_match = re.search(r'id="__VIEWSTATE"\s+value="([^"]+)"', html_init)
         ev_match = re.search(r'id="__EVENTVALIDATION"\s+value="([^"]+)"', html_init)
         if vs_match and ev_match:
-            for kw in ["AI", "線上", "Gemini", "NotebookLM", "ChatGPT", "Canva"]:
+            for kw in ["AI", "線上"]:
                 payload = {
                     "__EVENTTARGET": "",
                     "__EVENTARGUMENT": "",
@@ -285,10 +285,19 @@ def _query_inservice_city(city_code: str, city_name: str, today: date):
                     continue
                 if is_internal_school_only(course_type) or is_internal_school_only(title):
                     continue
+                c_start = parse_date_safely(start_date)
                 c_end = parse_date_safely(end_date)
                 if c_end and c_end < today:
                     continue
-                # 不先依標題過濾，保留非校內且未過期之候選課程，於詳細頁檢查「課程簡介」與「課程表及注意事項」
+                is_today_row = bool(c_start and c_end and c_start <= today <= c_end)
+                # 篩選具 AI、AI工具、線上、數位、科技、Cool English 或推播當日之候選課程（避免向政府伺服器發送過多請求被阻擋）
+                if not (
+                    is_ai_related(title)
+                    or is_strictly_online(title)
+                    or is_today_row
+                    or any(k in title for k in ["數位", "科技", "資訊", "Cool English", "酷英", "AI"])
+                ):
+                    continue
                 candidates[cid] = {
                     "cid": cid,
                     "city": city_name,
@@ -426,7 +435,7 @@ def _verify_inservice_detail(item: dict, today: date):
 def fetch_inservice_all_cities(today: date):
     """平行搜尋全臺各縣市的全國教師在職進修網 AI/AI工具 線上研習"""
     all_candidates = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(_query_inservice_city, code, name, today) for code, name in ALL_CITIES]
         for f in as_completed(futures):
             for item in f.result():
@@ -434,7 +443,7 @@ def fetch_inservice_all_cities(today: date):
 
     print(f"[資訊] 全國教師在職進修網候選課程共 {len(all_candidates)} 筆，開始逐筆驗證...")
     verified = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(_verify_inservice_detail, item, today) for item in all_candidates.values()]
         for f in as_completed(futures):
             res = f.result()
@@ -444,7 +453,7 @@ def fetch_inservice_all_cities(today: date):
     # 排序：今日研習優先 -> 附有會議連結優先 -> AI/AI工具相關優先 -> 日期由近到遠
     verified.sort(key=lambda x: (not x[0], not x[2], not x[1], x[3]))
     print(f"[資訊] 全國教師在職進修網符合嚴選條件共 {len(verified)} 筆")
-    return [x[4] for x in verified[:25]]
+    return [x[4] for x in verified[:20]]
 
 
 # ==============================================================================
@@ -555,40 +564,74 @@ def fetch_tainan_passport_online(today: date):
 # 3. 各級學校和教育單位（最新消息 / 公佈欄 / 研習訊息，跨各縣市）
 # ==============================================================================
 def search_yahoo_results(query: str, max_items: int = 8):
-    """透過 Yahoo 奇摩搜尋取得 (title, url, snippet) 清單，過濾廣告與無效連結"""
+    """透過 Yahoo 奇摩搜尋取得 (title, url, snippet) 清單（含重試與 DuckDuckGo 備援，避免暫時性 500 錯誤）"""
     encoded_q = urllib.parse.quote(query)
     url = f"https://tw.search.yahoo.com/search?p={encoded_q}&btf=m"
     found = []
     seen_urls = set()
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        if resp.status_code != 200:
-            return found
-        soup = BeautifulSoup(decode_response(resp), "html.parser")
-        for card in soup.select("div.algo"):
-            a_tag = card.select_one("h3 a, a:has(h3)")
-            if not a_tag or not a_tag.has_attr("href"):
-                continue
-            href = a_tag["href"]
-            ru_match = re.search(r"RU=([^/]+)/RK=", href)
-            raw_url = urllib.parse.unquote(ru_match.group(1)) if ru_match else href
-            if any(skip in raw_url.lower() for skip in [
-                "yahoo.com", "bing.com", "doubleclick.net", "googleadservices",
-                "uservoice.com", "inservice.edu.tw", "e-learning.tn.edu.tw"
-            ]):
-                continue
-            h3_tag = card.select_one("h3")
-            title = html.unescape(h3_tag.get_text(" ", strip=True)) if h3_tag else ""
-            comp_text = card.select_one("div.compText")
-            snippet = html.unescape(comp_text.get_text(" ", strip=True)) if comp_text else ""
 
-            if title and raw_url not in seen_urls:
-                seen_urls.add(raw_url)
-                found.append((title, raw_url, snippet))
-                if len(found) >= max_items:
-                    break
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=12)
+            if resp.status_code != 200:
+                print(f"[警告] Yahoo 搜尋 '{query}' 回傳狀態碼 {resp.status_code} (第 {attempt + 1} 次)")
+                continue
+            soup = BeautifulSoup(decode_response(resp), "html.parser")
+            for card in soup.select("div.algo"):
+                a_tag = card.select_one("h3 a, a:has(h3)")
+                if not a_tag or not a_tag.has_attr("href"):
+                    continue
+                href = a_tag["href"]
+                ru_match = re.search(r"RU=([^/]+)/RK=", href)
+                raw_url = urllib.parse.unquote(ru_match.group(1)) if ru_match else href
+                if any(skip in raw_url.lower() for skip in [
+                    "yahoo.com", "bing.com", "doubleclick.net", "googleadservices",
+                    "uservoice.com", "inservice.edu.tw", "e-learning.tn.edu.tw"
+                ]):
+                    continue
+                h3_tag = card.select_one("h3")
+                title = html.unescape(h3_tag.get_text(" ", strip=True)) if h3_tag else ""
+                comp_text = card.select_one("div.compText")
+                snippet = html.unescape(comp_text.get_text(" ", strip=True)) if comp_text else ""
+
+                if title and raw_url not in seen_urls:
+                    seen_urls.add(raw_url)
+                    found.append((title, raw_url, snippet))
+                    if len(found) >= max_items:
+                        return found
+            if found:
+                return found
+        except Exception as e:
+            print(f"[警告] Yahoo 搜尋 '{query}' 失敗 (第 {attempt + 1} 次): {e}")
+
+    # 若 Yahoo 失敗或被擋，改用 DuckDuckGo HTML 備援
+    try:
+        ddg_url = f"https://html.duckduckgo.com/html/?q={encoded_q}"
+        r_ddg = requests.get(ddg_url, headers=HEADERS, timeout=12)
+        if r_ddg.status_code == 200:
+            soup_ddg = BeautifulSoup(decode_response(r_ddg), "html.parser")
+            for res_div in soup_ddg.select("div.result"):
+                a_tag = res_div.select_one("a.result__a")
+                if not a_tag or not a_tag.has_attr("href"):
+                    continue
+                href = a_tag["href"]
+                uddg = re.search(r"uddg=([^&]+)", href)
+                raw_url = urllib.parse.unquote(uddg.group(1)) if uddg else href
+                if any(skip in raw_url.lower() for skip in [
+                    "yahoo.com", "bing.com", "duckduckgo.com", "inservice.edu.tw", "e-learning.tn.edu.tw"
+                ]):
+                    continue
+                title = html.unescape(a_tag.get_text(" ", strip=True))
+                snip_tag = res_div.select_one("a.result__snippet")
+                snippet = html.unescape(snip_tag.get_text(" ", strip=True)) if snip_tag else ""
+                if title and raw_url not in seen_urls:
+                    seen_urls.add(raw_url)
+                    found.append((title, raw_url, snippet))
+                    if len(found) >= max_items:
+                        break
     except Exception as e:
-        print(f"[警告] 搜尋 '{query}' 失敗: {e}")
+        print(f"[警告] DuckDuckGo 備援搜尋失敗: {e}")
+
     return found
 
 
@@ -609,8 +652,8 @@ def _verify_school_webpage(title: str, url: str, snippet: str, today: date):
         for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
             tag.decompose()
 
-        # 優先取主要文章區塊，避免抓到側邊欄或全站頁尾年份
-        main_node = soup.select_one("main, article, .entry-content, .mcont, #main") or soup.body or soup
+        # 優先取主要文章區塊（注意 Rpage 學校網站應優先取 .mpgdetail 或 #main-content，避免誤取左側選單的 .mcont）
+        main_node = soup.select_one(".mpgdetail, main, article, .entry-content, #main-content, #main") or soup.body or soup
         lines = [line.strip() for line in main_node.get_text("\n", strip=True).splitlines() if line.strip()]
         body_text = "\n".join(lines)
 
@@ -790,8 +833,9 @@ def fetch_social_platforms(today: date):
     roc_year = today.year - 1911
 
     social_queries = [
-        ("FB", f'("線上研習" OR "線上工作坊" OR "Google Meet") AI 研習 {roc_year}年 (site:facebook.com/groups OR site:facebook.com/*/posts OR site:facebook.com/events)'),
-        ("IG/Threads", f'("線上研習" OR "線上講座" OR "線上工作坊") AI ({roc_year}年 OR {today.year}) (site:instagram.com/p OR site:instagram.com/reel OR site:threads.net)'),
+        ("FB", f'("線上研習" OR "線上工作坊" OR "Google Meet") AI 研習 ({roc_year}年 OR {today.year}) site:facebook.com'),
+        ("FB", f'("線上研習" OR "線上工作坊") AI 研習 {roc_year}年 (site:facebook.com/groups OR site:facebook.com/*/posts)'),
+        ("IG/Threads", f'("線上研習" OR "線上講座" OR "線上工作坊") AI ({roc_year}年 OR {today.year}) (site:instagram.com OR site:threads.net)'),
     ]
 
     for platform, q in social_queries:
@@ -811,11 +855,22 @@ def fetch_social_platforms(today: date):
             if not is_ai_related(combined) or not is_strictly_online(combined):
                 continue
 
-            # 嚴格要求貼文摘要內有明確活動日期（包含 115年11月17日 或 11/17），且最大日期 >= today
-            snippet_body = re.sub(r"^\d{4}年\d{1,2}月\d{1,2}日\s*·\s*", "", snippet)
+            # 檢查貼文內活動日期（若有日期則最大日期必須 >= today；若摘要被截斷無活動日期，僅允許本月或幾天內的近期貼文）
+            post_date_match = re.match(r"^(\d{4}年\d{1,2}月\d{1,2}日|\d+\s*(?:小時|天)前)\s*·\s*", snippet)
+            post_prefix = post_date_match.group(1) if post_date_match else ""
+            snippet_body = snippet[post_date_match.end():] if post_date_match else snippet
+
             event_dates = extract_all_dates(f"{title} {snippet_body}", include_month_day_year=today.year)
-            if not event_dates or max(event_dates) < today:
-                continue
+            if event_dates:
+                if max(event_dates) < today:
+                    continue
+                date_hint = f"（{max(event_dates).strftime('%Y/%m/%d')}）"
+            else:
+                # 摘要未截到活動日期時，須為近期貼文（幾小時/幾天前，或本月發文）
+                is_recent_post = ("前" in post_prefix) or (f"{today.year}年{today.month}月" in post_prefix)
+                if not is_recent_post:
+                    continue
+                date_hint = ""
 
             # 若地點欄明確寫了實體地址則略過
             loc_matches = re.findall(r"(?:地點|上課地點|研習地點)[:：]\s*([^\n。；]{2,40})", combined)
@@ -826,8 +881,8 @@ def fetch_social_platforms(today: date):
             tag = "IG/Threads" if ("instagram.com" in url or "threads.net" in url or "threads.com" in url) else platform
             is_today = today in event_dates
             badge = "🔥[今日研習]" if is_today else f"🟢[{tag}]"
-            date_hint = max(event_dates).strftime("%Y/%m/%d")
-            results.append(f"• {badge} {title}（{date_hint}）\n  🔗 {url}")
+            date_hint = f"（{max(event_dates).strftime('%Y/%m/%d')}）" if event_dates else ""
+            results.append(f"• {badge} {title}{date_hint}\n  🔗 {url}")
             if len(results) >= 6:
                 break
 
