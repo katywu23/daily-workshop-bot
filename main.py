@@ -9,6 +9,7 @@ from datetime import datetime, date, timezone, timedelta
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
 
 # 停用 SSL 警告（部分學校/政府網站憑證鏈不完整時確保穩定連線）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -34,10 +35,12 @@ ALL_CITIES = [
     ("24", "金門縣"), ("25", "連江縣"),
 ]
 
-# AI 相關關鍵字
+# AI 與常見 AI 工具相關關鍵字
 AI_KEYWORDS = [
-    "AI", "人工智慧", "生成式", "ChatGPT", "Gemini", "NotebookLM",
-    "Copilot", "Claude", "Canva", "智慧學習", "大語言模型", "AIGC"
+    "AI", "人工智慧", "生成式", "AIGC", "AI工具", "智慧學習", "大語言模型", "LLM",
+    "GPT", "ChatGPT", "Gemini", "NotebookLM", "Copilot", "Claude", "Canva",
+    "Perplexity", "Gamma", "Suno", "Padlet", "Midjourney", "Grok", "Felo", "Poe",
+    "MagicSchool", "Diffit", "Eduaide", "Brisk", "DALL-E", "Prompt", "提示詞", "Vibe Coding"
 ]
 
 # 明確判定為「線上形式」之關鍵字
@@ -69,9 +72,28 @@ STRICT_STREET_ADDRESS_PATTERN = re.compile(
 )
 
 MEETING_LINK_PATTERN = re.compile(
-    r"(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|webex\.com)",
+    r"(?:https?://)?(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|webex\.com|youtu\.be|youtube\.com/live)/[^\s<>\"'。，；)）]+",
     re.IGNORECASE,
 )
+
+LABELED_ONLINE_URL_PATTERN = re.compile(
+    r"(?:會議連結|線上連結|視訊連結|直播連結|直播網址|會議網址|線上會議|Google\s*Meet|Teams|Zoom)[^\n]{0,25}?(https?://[^\s<>\"'。，；)）]+)",
+    re.IGNORECASE,
+)
+
+
+def extract_meeting_url(text: str) -> str:
+    """從課程簡介或注意事項擷取會議/線上連結網址"""
+    if not text:
+        return ""
+    m = MEETING_LINK_PATTERN.search(text)
+    if m:
+        url = m.group(0).rstrip(".,;。，；)）")
+        return url if url.startswith("http") else f"https://{url}"
+    m2 = LABELED_ONLINE_URL_PATTERN.search(text)
+    if m2:
+        return m2.group(1).rstrip(".,;。，；)）")
+    return ""
 
 
 def decode_response(resp: requests.Response) -> str:
@@ -92,8 +114,10 @@ def decode_response(resp: requests.Response) -> str:
 
 
 def is_ai_related(text: str) -> bool:
+    if re.search(r"(?<![A-Za-z])AI(?![A-Za-z])", text, re.IGNORECASE):
+        return True
     text_upper = text.upper()
-    return any(kw.upper() in text_upper for kw in AI_KEYWORDS)
+    return any(kw.upper() in text_upper for kw in AI_KEYWORDS if kw != "AI")
 
 
 def is_strictly_online(text: str) -> bool:
@@ -213,7 +237,7 @@ def _query_inservice_city(city_code: str, city_name: str, today: date):
         vs_match = re.search(r'id="__VIEWSTATE"\s+value="([^"]+)"', html_init)
         ev_match = re.search(r'id="__EVENTVALIDATION"\s+value="([^"]+)"', html_init)
         if vs_match and ev_match:
-            for kw in ["AI", "線上"]:
+            for kw in ["AI", "線上", "Gemini", "NotebookLM", "ChatGPT", "Canva"]:
                 payload = {
                     "__EVENTTARGET": "",
                     "__EVENTARGUMENT": "",
@@ -252,8 +276,10 @@ def _query_inservice_city(city_code: str, city_name: str, today: date):
                     continue
                 if is_internal_school_only(course_type) or is_internal_school_only(title):
                     continue
-                if not is_ai_related(title):
+                c_end = parse_date_safely(end_date)
+                if c_end and c_end < today:
                     continue
+                # 不先依標題過濾，保留非校內且未過期之候選課程，於詳細頁檢查「課程簡介」與「課程表及注意事項」
                 candidates[cid] = {
                     "cid": cid,
                     "city": city_name,
@@ -267,12 +293,16 @@ def _query_inservice_city(city_code: str, city_name: str, today: date):
     return list(candidates.values())
 
 
-def _verify_inservice_detail(item: dict, today: date):
-    """進入 CourseView.aspx 逐一驗證：無實體上課地址、線上研習、免費、非校內、尚在報名或推播當日"""
+def _verify_inservice_detail(item: dict, today: date, session: requests.Session):
+    """進入 CourseView.aspx 逐一驗證：
+    - 若『課程簡介』或『課程表及注意事項』有會議/線上連結網址 -> 直接視為線上研習並納入（不因主辦單位預設填寫地址而排除）
+    - 若無會議連結 -> 維持檢查『上課地點』不能出現實體地址且須為線上/數位遠距，並符合 AI/AI工具相關條件（標題、課程簡介或課程表及注意事項）
+    - 全數皆須免費、非校內研習、且尚未過期（尚在報名中或推播當日）
+    """
     cid = item["cid"]
     detail_url = f"https://www1.inservice.edu.tw/NAPP/CourseView.aspx?cid={cid}"
     try:
-        resp = requests.get(detail_url, headers=HEADERS, timeout=12)
+        resp = session.get(detail_url, headers=HEADERS, timeout=12)
         page_html = decode_response(resp)
         soup = BeautifulSoup(page_html, "html.parser")
 
@@ -296,14 +326,25 @@ def _verify_inservice_detail(item: dict, today: date):
             if fee_num and int(fee_num) > 0:
                 return None
 
-        # 若有出現實體上課地址，就不要蒐集
-        if has_physical_address(location_text):
-            return None
+        # 檢查「課程簡介」或「課程表及注意事項」是否有會議/線上連結網址
+        intro_and_notes = f"{intro_text}\n{notes_text}"
+        meet_url = extract_meeting_url(intro_and_notes)
+        has_meeting_link = bool(meet_url)
 
-        # 必須為線上研習
-        combined_online_check = f"{item['title']} {time_mode_text} {location_text} {intro_text} {notes_text}"
-        if "數位遠距教學" not in time_mode_text and not is_strictly_online(combined_online_check):
-            return None
+        ai_matched = is_ai_related(f"{item['title']} {intro_text} {notes_text}")
+
+        if has_meeting_link:
+            # 只要簡介或注意事項明確給出線上會議連結，即視為線上研習納入蒐集
+            pass
+        else:
+            # 無直接會議連結時：須為 AI 相關、不可有實體上課地址，且須為線上研習
+            if not ai_matched:
+                return None
+            if has_physical_address(location_text):
+                return None
+            combined_online_check = f"{item['title']} {time_mode_text} {location_text} {intro_text} {notes_text}"
+            if "數位遠距教學" not in time_mode_text and not is_strictly_online(combined_online_check):
+                return None
 
         # 嚴格過濾研習時間：必須能明確解析日期，且結束日 >= today（含推播當日）
         c_dates = extract_all_dates(course_date_text or f"{item['start_date']} {item['end_date']}")
@@ -318,37 +359,29 @@ def _verify_inservice_detail(item: dict, today: date):
         reg_end = reg_dates[-1] if reg_dates else None
         is_in_reg_period = (reg_end is not None and reg_end >= today)
 
-        # 必須「尚在報名區間內」或「研習時間為推播當日」
-        if not (is_in_reg_period or is_today_course):
+        # 只要「尚在報名區間內」或「研習時間為推播當日（或已附會議連結免事先報名）」皆保留
+        no_reg_needed = any(k in intro_and_notes for k in ["無需事先報名", "免事先報名", "無需報名", "免報名", "直接點選", "自由參加"])
+        if not (is_in_reg_period or is_today_course or (has_meeting_link and no_reg_needed)):
             return None
 
-        # 若未開放線上報名且無其他外部報名連結且非今日研習，則略過
-        if "未開放線上報名" in online_reg_text and not is_today_course:
-            has_external_reg = any(k in f"{intro_text} {notes_text}" for k in ["forms.gle", "報名網址", "報名表單", "線上報名"])
+        # 若未開放線上報名且無其他外部報名連結且非今日研習/免報名，則略過
+        if "未開放線上報名" in online_reg_text and not is_today_course and not no_reg_needed:
+            has_external_reg = any(k in intro_and_notes for k in ["forms.gle", "報名網址", "報名表單", "線上報名"])
             if not has_external_reg:
                 return None
 
-        meet_match = re.search(
-            r"(?:https?://)?(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|webex\.com)/[^\s<>\"'。，；)]+",
-            f"{intro_text} {notes_text}",
-            re.IGNORECASE,
-        )
-        if meet_match:
-            meet_url = meet_match.group(0)
-            if not meet_url.startswith("http"):
-                meet_url = f"https://{meet_url}"
-            meet_line = f"\n  💻 會議連結: {meet_url}"
-        else:
-            meet_line = ""
-
+        meet_line = f"\n  💻 會議連結: {meet_url}" if meet_url else ""
+        loc_display = "線上會議（詳見會議連結）" if (has_meeting_link and has_physical_address(location_text)) else (location_text or "線上遠距")
         badge = "🔥[今日研習]" if is_today_course else "🟢[線上研習]"
 
         return (
             is_today_course,
+            ai_matched,
+            has_meeting_link,
             c_start or today,
             f"• {badge} {item['title']}\n"
             f"  📅 研習日期: {item['start_date']}｜🏫 {item['unit']}\n"
-            f"  📍 上課地點: {location_text or '線上遠距'}{meet_line}\n"
+            f"  📍 上課地點: {loc_display}{meet_line}\n"
             f"  🔗 {detail_url}"
         )
     except Exception:
@@ -356,24 +389,29 @@ def _verify_inservice_detail(item: dict, today: date):
 
 
 def fetch_inservice_all_cities(today: date):
-    """平行搜尋全臺各縣市的全國教師在職進修網 AI 線上研習"""
+    """平行搜尋全臺各縣市的全國教師在職進修網 AI/AI工具 線上研習"""
     all_candidates = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(_query_inservice_city, code, name, today) for code, name in ALL_CITIES]
         for f in as_completed(futures):
             for item in f.result():
                 all_candidates[item["cid"]] = item
 
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+
     verified = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_verify_inservice_detail, item, today) for item in all_candidates.values()]
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(_verify_inservice_detail, item, today, session) for item in all_candidates.values()]
         for f in as_completed(futures):
             res = f.result()
             if res:
                 verified.append(res)
 
-    verified.sort(key=lambda x: (not x[0], x[1]))
-    return [x[2] for x in verified[:8]]
+    # 排序：今日研習優先 -> AI/AI工具相關優先 -> 附有會議連結優先 -> 日期由近到遠
+    verified.sort(key=lambda x: (not x[0], not x[1], not x[2], x[3]))
+    return [x[4] for x in verified[:15]]
 
 
 # ==============================================================================
@@ -746,8 +784,8 @@ def fetch_social_platforms(today: date):
 # ==============================================================================
 # LINE Messaging API 推播
 # ==============================================================================
-def send_line_push_message(token: str, user_id: str, text: str):
-    """透過 LINE Messaging API 發送 Push Message"""
+def send_line_push_message(token: str, user_id: str, messages_list: list):
+    """透過 LINE Messaging API 發送 Push Message（支援單次最多 5 則訊息氣泡，避免超過 5000 字元截斷）"""
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Content-Type": "application/json",
@@ -756,10 +794,9 @@ def send_line_push_message(token: str, user_id: str, text: str):
     payload = {
         "to": user_id,
         "messages": [
-            {
-                "type": "text",
-                "text": text[:4950],  # 確保不超過 LINE 單則 5000 字元上限
-            }
+            {"type": "text", "text": msg[:4950]}
+            for msg in messages_list[:5]
+            if msg.strip()
         ],
     }
     response = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -774,7 +811,7 @@ def main():
 
     today = datetime.now(TW_TZ).date()
     today_str = today.strftime("%Y-%m-%d")
-    print(f"=== 啟動【各縣市 × 純線上研習 × AI × 免費 × 報名中/今日 × 非校內 × 無實體地址】爬蟲 ({today_str}) ===")
+    print(f"=== 啟動【各縣市 × 純線上研習 × AI/AI工具 × 免費 × 報名中/今日 × 非校內】爬蟲 ({today_str}) ===")
 
     inservice_items = fetch_inservice_all_cities(today)
     passport_items = fetch_tainan_passport_online(today)
@@ -782,7 +819,7 @@ def main():
     social_items = fetch_social_platforms(today)
 
     sections = [
-        "📘【1. 全國教師在職進修資訊網（各縣市線上AI）】\n"
+        "📘【1. 全國教師在職進修資訊網（各縣市線上/含會議連結/AI工具）】\n"
         + ("\n".join(inservice_items) if inservice_items else "• 目前暫無符合所有嚴選條件之課程"),
         "📗【2. 臺南市政府教育局學習護照（線上AI）】\n"
         + ("\n".join(passport_items) if passport_items else "• 目前暫無符合所有嚴選條件之課程"),
@@ -792,21 +829,26 @@ def main():
         + ("\n".join(social_items) if social_items else "• 目前暫無符合所有嚴選條件之貼文"),
     ]
 
-    message = (
+    header = (
         f"☀️ 早安！{today_str}\n"
-        f"🎯 今日嚴選：【各縣市 ＋ 純線上AI研習 ＋ 免費 ＋ 推播當日及未來報名中 ＋ 非校內 ＋ 無實體地址】\n\n"
-        + "\n\n".join(sections)
+        f"🎯 今日嚴選：【各縣市 ＋ 線上研習/含會議連結 ＋ AI與AI工具 ＋ 免費 ＋ 推播當日及報名中 ＋ 非校內】"
     )
+    full_message = f"{header}\n\n" + "\n\n".join(sections)
 
     print("\n--- 預覽推播內容 ---")
-    print(message)
+    print(full_message)
     print("--------------------\n")
 
     if not token or not user_id:
         print("[提示] 未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID 環境變數，略過實際發送。")
         sys.exit(0)
 
-    send_line_push_message(token, user_id, message)
+    if len(full_message) <= 4800:
+        messages_to_send = [full_message]
+    else:
+        messages_to_send = [f"{header}\n\n{sections[0]}"] + sections[1:]
+
+    send_line_push_message(token, user_id, messages_to_send)
 
 
 if __name__ == "__main__":
