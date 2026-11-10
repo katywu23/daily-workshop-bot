@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import html
+import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timezone, timedelta
@@ -176,17 +177,17 @@ def has_past_year(text: str, today: date) -> bool:
 
 
 def parse_date_safely(date_str: str):
-    """解析西元或民國日期格式"""
+    """解析西元或民國日期格式（允許年月日之間有空白）"""
     if not date_str:
         return None
-    match_ad = re.search(r"(20\d{2})[-/.年](0?[1-9]|1[0-2])[-/.月](0?[1-9]|[12]\d|3[01])", date_str)
+    match_ad = re.search(r"(20\d{2})\s*[-/.年]\s*(0?[1-9]|1[0-2])\s*[-/.月]\s*(0?[1-9]|[12]\d|3[01])", date_str)
     if match_ad:
         try:
             return date(int(match_ad.group(1)), int(match_ad.group(2)), int(match_ad.group(3)))
         except ValueError:
             return None
 
-    match_roc = re.search(r"(1\d{2})[-/.年](0?[1-9]|1[0-2])[-/.月](0?[1-9]|[12]\d|3[01])", date_str)
+    match_roc = re.search(r"(1\d{2})\s*[-/.年]\s*(0?[1-9]|1[0-2])\s*[-/.月]\s*(0?[1-9]|[12]\d|3[01])", date_str)
     if match_roc:
         try:
             return date(int(match_roc.group(1)) + 1911, int(match_roc.group(2)), int(match_roc.group(3)))
@@ -195,19 +196,27 @@ def parse_date_safely(date_str: str):
     return None
 
 
-def extract_all_dates(text: str):
-    """從文字中擷取所有日期（西元或民國）"""
+def extract_all_dates(text: str, include_month_day_year: int = None):
+    """從文字中擷取所有日期（西元或民國，可選補充僅有 M/D 或 M月D日 的短日期）"""
     dates = []
-    for m in re.finditer(r"(20\d{2})[-/.年](0?[1-9]|1[0-2])[-/.月](0?[1-9]|[12]\d|3[01])", text):
+    for m in re.finditer(r"(20\d{2})\s*[-/.年]\s*(0?[1-9]|1[0-2])\s*[-/.月]\s*(0?[1-9]|[12]\d|3[01])", text):
         try:
             dates.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
         except ValueError:
             pass
-    for m in re.finditer(r"(1\d{2})[-/.年](0?[1-9]|1[0-2])[-/.月](0?[1-9]|[12]\d|3[01])", text):
+    for m in re.finditer(r"(1\d{2})\s*[-/.年]\s*(0?[1-9]|1[0-2])\s*[-/.月]\s*(0?[1-9]|[12]\d|3[01])", text):
         try:
             dates.append(date(int(m.group(1)) + 1911, int(m.group(2)), int(m.group(3))))
         except ValueError:
             pass
+    if include_month_day_year:
+        # 去掉已包含完整年份的日期字串後，再比對如 "10/26" 或 "11月17日"
+        stripped = re.sub(r"(?:20\d{2}|1\d{2})\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}日?", "", text)
+        for m in re.finditer(r"(?<![\d/:])(1[0-2]|0?[1-9])\s*[/月]\s*(3[01]|[12]\d|0?[1-9])(?![\d/:])", stripped):
+            try:
+                dates.append(date(include_month_day_year, int(m.group(1)), int(m.group(2))))
+            except ValueError:
+                pass
     return dates
 
 
@@ -293,7 +302,22 @@ def _query_inservice_city(city_code: str, city_name: str, today: date):
     return list(candidates.values())
 
 
-def _verify_inservice_detail(item: dict, today: date, session: requests.Session):
+_thread_local = threading.local()
+
+
+def _get_thread_session() -> requests.Session:
+    """為每個執行緒提供獨立且具連線重試能力的 requests.Session（避免多執行緒共用 Session 發生錯誤或連線被拒）"""
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _thread_local.session = sess
+    return sess
+
+
+def _verify_inservice_detail(item: dict, today: date):
     """進入 CourseView.aspx 逐一驗證：
     - 若『課程簡介』或『課程表及注意事項』有會議/線上連結網址 -> 直接視為線上研習並納入（不因主辦單位預設填寫地址而排除）
     - 若無會議連結 -> 維持檢查『上課地點』不能出現實體地址且須為線上/數位遠距，並符合 AI/AI工具相關條件（標題、課程簡介或課程表及注意事項）
@@ -301,8 +325,19 @@ def _verify_inservice_detail(item: dict, today: date, session: requests.Session)
     """
     cid = item["cid"]
     detail_url = f"https://www1.inservice.edu.tw/NAPP/CourseView.aspx?cid={cid}"
+    session = _get_thread_session()
+    resp = None
+    for attempt in range(2):
+        try:
+            resp = session.get(detail_url, headers=HEADERS, timeout=12)
+            if resp.status_code == 200:
+                break
+        except Exception:
+            if attempt == 1:
+                return None
+    if not resp or resp.status_code != 200:
+        return None
     try:
-        resp = session.get(detail_url, headers=HEADERS, timeout=12)
         page_html = decode_response(resp)
         soup = BeautifulSoup(page_html, "html.parser")
 
@@ -391,27 +426,25 @@ def _verify_inservice_detail(item: dict, today: date, session: requests.Session)
 def fetch_inservice_all_cities(today: date):
     """平行搜尋全臺各縣市的全國教師在職進修網 AI/AI工具 線上研習"""
     all_candidates = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(_query_inservice_city, code, name, today) for code, name in ALL_CITIES]
         for f in as_completed(futures):
             for item in f.result():
                 all_candidates[item["cid"]] = item
 
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
-    session.mount("https://", adapter)
-
+    print(f"[資訊] 全國教師在職進修網候選課程共 {len(all_candidates)} 筆，開始逐筆驗證...")
     verified = []
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        futures = [executor.submit(_verify_inservice_detail, item, today, session) for item in all_candidates.values()]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_verify_inservice_detail, item, today) for item in all_candidates.values()]
         for f in as_completed(futures):
             res = f.result()
             if res:
                 verified.append(res)
 
-    # 排序：今日研習優先 -> AI/AI工具相關優先 -> 附有會議連結優先 -> 日期由近到遠
-    verified.sort(key=lambda x: (not x[0], not x[1], not x[2], x[3]))
-    return [x[4] for x in verified[:15]]
+    # 排序：今日研習優先 -> 附有會議連結優先 -> AI/AI工具相關優先 -> 日期由近到遠
+    verified.sort(key=lambda x: (not x[0], not x[2], not x[1], x[3]))
+    print(f"[資訊] 全國教師在職進修網符合嚴選條件共 {len(verified)} 筆")
+    return [x[4] for x in verified[:25]]
 
 
 # ==============================================================================
@@ -735,21 +768,40 @@ def fetch_schools_and_edu_units(today: date):
 # ==============================================================================
 # 4. 各社群平台 (FB、IG、Threads，各縣市線上 AI 研習，已移除 Accupass)
 # ==============================================================================
+def is_specific_social_post_url(url: str) -> bool:
+    """只保留具體的貼文、活動或貼文永久連結，排除粉絲專頁首頁、個人主頁或社團首頁"""
+    lower = url.lower()
+    if "facebook.com" in lower:
+        return any(seg in lower for seg in [
+            "/posts/", "/permalink/", "/events/", "/photos/", "/videos/",
+            "story_fbid=", "fbid=", "/reel/"
+        ])
+    if "instagram.com" in lower:
+        return any(seg in lower for seg in ["/p/", "/reel/"])
+    if "threads.net" in lower or "threads.com" in lower:
+        return "/post/" in lower
+    return False
+
+
 def fetch_social_platforms(today: date):
-    """抓取 FB、IG、Threads 上關於「線上研習 + AI + 免費 + 非校內 + 無地址 + 未來/當日日期」資訊"""
+    """抓取 FB、IG、Threads 上具體貼文之「線上研習 + AI + 免費 + 非校內 + 無地址 + 未來/當日日期」資訊"""
     results = []
     seen_urls = set()
     roc_year = today.year - 1911
 
     social_queries = [
-        ("FB", f'("線上研習" OR "線上工作坊" OR "Google Meet") AI 研習 ({roc_year}年 OR {today.year}) site:facebook.com'),
-        ("IG/Threads", f'("線上研習" OR "線上講座" OR "線上工作坊") AI ({roc_year}年 OR {today.year}) (site:instagram.com OR site:threads.net)'),
+        ("FB", f'("線上研習" OR "線上工作坊" OR "Google Meet") AI 研習 {roc_year}年 (site:facebook.com/groups OR site:facebook.com/*/posts OR site:facebook.com/events)'),
+        ("IG/Threads", f'("線上研習" OR "線上講座" OR "線上工作坊") AI ({roc_year}年 OR {today.year}) (site:instagram.com/p OR site:instagram.com/reel OR site:threads.net)'),
     ]
 
     for platform, q in social_queries:
-        for title, url, snippet in search_yahoo_results(q, max_items=6):
+        for title, url, snippet in search_yahoo_results(q, max_items=10):
             if url in seen_urls:
                 continue
+            # 嚴格排除粉專首頁、社團首頁與個人檔案首頁，只要單篇研習貼文或活動頁
+            if not is_specific_social_post_url(url):
+                continue
+
             combined = f"{title} {snippet}"
 
             if has_past_year(combined, today):
@@ -759,10 +811,10 @@ def fetch_social_platforms(today: date):
             if not is_ai_related(combined) or not is_strictly_online(combined):
                 continue
 
-            # 若摘要內有明確活動/研習日期，確認未過期（排除摘要開頭的貼文發佈日期 e.g. "2026年10月20日 ·"）
+            # 嚴格要求貼文摘要內有明確活動日期（包含 115年11月17日 或 11/17），且最大日期 >= today
             snippet_body = re.sub(r"^\d{4}年\d{1,2}月\d{1,2}日\s*·\s*", "", snippet)
-            event_dates = extract_all_dates(f"{title} {snippet_body}")
-            if event_dates and max(event_dates) < today:
+            event_dates = extract_all_dates(f"{title} {snippet_body}", include_month_day_year=today.year)
+            if not event_dates or max(event_dates) < today:
                 continue
 
             # 若地點欄明確寫了實體地址則略過
@@ -771,10 +823,11 @@ def fetch_social_platforms(today: date):
                 continue
 
             seen_urls.add(url)
-            tag = "IG/Threads" if ("instagram.com" in url or "threads.net" in url) else platform
+            tag = "IG/Threads" if ("instagram.com" in url or "threads.net" in url or "threads.com" in url) else platform
             is_today = today in event_dates
             badge = "🔥[今日研習]" if is_today else f"🟢[{tag}]"
-            results.append(f"• {badge} {title}\n  🔗 {url}")
+            date_hint = max(event_dates).strftime("%Y/%m/%d")
+            results.append(f"• {badge} {title}（{date_hint}）\n  🔗 {url}")
             if len(results) >= 6:
                 break
 
@@ -846,7 +899,33 @@ def main():
     if len(full_message) <= 4800:
         messages_to_send = [full_message]
     else:
-        messages_to_send = [f"{header}\n\n{sections[0]}"] + sections[1:]
+        messages_to_send = []
+        current = header
+        for sec in sections:
+            if len(current) + 2 + len(sec) <= 4800:
+                current += "\n\n" + sec
+            elif len(sec) <= 4800:
+                if current:
+                    messages_to_send.append(current)
+                current = sec
+            else:
+                if current:
+                    messages_to_send.append(current)
+                    current = ""
+                # 若單一區塊超過 4800 字元，依項目切分
+                parts = sec.split("\n• ")
+                buf = parts[0]
+                for p in parts[1:]:
+                    entry = "\n• " + p
+                    if len(buf) + len(entry) <= 4800:
+                        buf += entry
+                    else:
+                        messages_to_send.append(buf)
+                        buf = "• " + p
+                if buf:
+                    current = buf
+        if current:
+            messages_to_send.append(current)
 
     send_line_push_message(token, user_id, messages_to_send)
 
