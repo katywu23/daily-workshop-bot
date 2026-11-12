@@ -2,8 +2,8 @@ name: Daily Online Workshop Scraper
 
 on:
   schedule:
-    # 每天 UTC 00:00 執行（對應台灣時間 UTC+8 早上 08:00）
-    - cron: '0 0 * * *'
+    # 每天 UTC 23:53 執行（對應台灣時間 UTC+8 早上 07:53，避開整點尖峰時段）
+    - cron: '53 23 * * *'
   workflow_dispatch: # 支援手動觸發測試
 
 jobs:
